@@ -148,12 +148,12 @@ def _match(text: str, rule: dict) -> bool:
 
     if "numeric_gt" in rule:
         numbers = re.findall(r"\d+(?:\.\d+)?", text)
-        return any(float(n) > rule["numeric_gt"] for n in numbers)
+        return any(float(n) > rule["numeric_gt"] for n in numbers if n)
 
     if "numeric_range" in rule:
         lo, hi = rule["numeric_range"]
         numbers = re.findall(r"\d+(?:\.\d+)?", text)
-        return any(lo <= float(n) <= hi for n in numbers)
+        return any(lo <= float(n) <= hi for n in numbers if n)
 
     return False
 
