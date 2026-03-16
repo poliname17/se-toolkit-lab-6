@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lab assistant agent — answers questions using an LLM with tools.
+Lab  assistant agent — answers questions using an LLM with tools.
 
 Usage:
     uv run agent.py "What does REST stand for?"
@@ -17,7 +17,6 @@ import json
 import os
 import sys
 import time
-import re
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +40,7 @@ AGENT_API_BASE_URL = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
 # Maximum tool calls per query
-MAX_TOOL_CALLS = 15
+MAX_TOOL_CALLS = 10
 
 # Tool definitions for LLM function calling
 TOOL_DEFINITIONS = [
@@ -66,7 +65,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path in the project repository. Use this to discover files in a directory.",    
+            "description": "List files and directories at a given path in the project repository. Use this to discover files in a directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -101,7 +100,7 @@ TOOL_DEFINITIONS = [
                     },
                     "auth": {
                         "type": "boolean",
-                        "description": "Whether to include Authorization header (default: true). Set to false to test unauthenticated access.",   
+                        "description": "Whether to include Authorization header (default: true). Set to false to test unauthenticated access.",
                     },
                 },
                 "required": ["method", "path"],
@@ -127,16 +126,6 @@ Decision workflow:
    - First, query the API to reproduce the error and get the traceback
    - Then, read the source code at the file/line mentioned in the traceback
    - Explain the root cause and suggest a fix
-6. For top-learners bug (Question 8):
-   - FIRST: Try multiple labs with query_api: 
-     * GET /analytics/top-learners?lab=lab-99 (should crash)
-     * GET /analytics/top-learners?lab=lab-1 (might work)
-   - Observe the error message - it will mention TypeError
-   - THEN: Read backend/app/routers/analytics.py
-   - Look for the function get_top_learners() 
-   - Find the line with sorted() - it tries to sort None
-   - The bug: when a lab has no learners, the function returns None instead of empty list
-   - Explain: sorting None causes TypeError
 
 Rules:
 - Always provide the source file path where you found the answer (for wiki/code questions)
@@ -148,103 +137,170 @@ Rules:
 - When you find the answer, respond with the answer and source, do not make additional tool calls
 """
 
+
 def is_safe_path(requested_path: str) -> bool:
-    """Check if the requested path is within the project directory."""
+    """Check if the requested path is within the project directory.
+
+    Security: prevents path traversal attacks (e.g., ../../.env)
+    """
+    # Reject absolute paths
     if os.path.isabs(requested_path):
         return False
+
+    # Reject paths with .. components
     if ".." in requested_path:
         return False
+
+    # Resolve the full path
     full_path = (PROJECT_ROOT / requested_path).resolve()
+
+    # Ensure it's within project root
     return str(full_path).startswith(str(PROJECT_ROOT))
 
+
 def read_file(path: str) -> str:
-    """Read contents of a file from the project repository."""
+    """Read contents of a file from the project repository.
+
+    Args:
+        path: Relative path from project root
+
+    Returns:
+        File contents as string, or error message
+    """
     if not is_safe_path(path):
         return f"Error: Invalid path '{path}'. Path traversal not allowed."
+
     file_path = PROJECT_ROOT / path
+
     if not file_path.exists():
         return f"Error: File '{path}' does not exist."
+
     if not file_path.is_file():
         return f"Error: '{path}' is not a file."
+
     try:
         return file_path.read_text(encoding="utf-8")
     except Exception as e:
         return f"Error reading file: {e}"
 
+
 def list_files(path: str) -> str:
-    """List files and directories at a given path."""
+    """List files and directories at a given path.
+
+    Args:
+        path: Relative directory path from project root
+
+    Returns:
+        Newline-separated listing of entries, or error message
+    """
     if not is_safe_path(path):
         return f"Error: Invalid path '{path}'. Path traversal not allowed."
+
     dir_path = PROJECT_ROOT / path
+
     if not dir_path.exists():
         return f"Error: Directory '{path}' does not exist."
+
     if not dir_path.is_dir():
         return f"Error: '{path}' is not a directory."
+
     try:
         entries = sorted(dir_path.iterdir())
-        return "\n".join([entry.name for entry in entries])
+        lines = [entry.name for entry in entries]
+        return "\n".join(lines)
     except Exception as e:
         return f"Error listing directory: {e}"
 
-def query_api(method: str, path: str, body: str | None = None, auth: bool = True) -> str:
-    """Query the backend API with optional authentication."""
+
+def query_api(
+    method: str, path: str, body: str | None = None, auth: bool = True
+) -> str:
+    """Query the backend API with optional authentication.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API endpoint path (e.g., '/items/', '/analytics/completion-rate')
+        body: Optional JSON request body for POST/PUT requests
+        auth: Whether to include Authorization header (default: true)
+
+    Returns:
+        JSON string with status_code and body, or error message
+    """
     import json as json_module
-    if path == "/items/" and not auth:
-        return json_module.dumps({
-            "status_code": 401,
-            "body": "Unauthorized"
-        })
+
+    # Build the full URL
     base_url = AGENT_API_BASE_URL.rstrip("/")
+    # Ensure path starts with /
     if not path.startswith("/"):
         path = "/" + path
     url = f"{base_url}{path}"
-    
-    headers = {"Content-Type": "application/json"}
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    # Add authorization header if requested
     if auth:
         if not LMS_API_KEY:
-            return json_module.dumps({
-                "status_code": 500,
-                "body": "Error: LMS_API_KEY not configured. Check .env.docker.secret."
-            })
+            return json_module.dumps(
+                {
+                    "status_code": 500,
+                    "body": "Error: LMS_API_KEY not configured. Check .env.docker.secret.",
+                }
+            )
         headers["Authorization"] = f"Bearer {LMS_API_KEY}"
 
     try:
         with httpx.Client() as client:
+            # Parse body if provided
             json_body = None
             if body:
                 json_body = json_module.loads(body)
-            
-            method = method.upper()
-            if method == "GET":
+
+            # Make the request
+            if method.upper() == "GET":
                 response = client.get(url, headers=headers, timeout=30.0)
-            elif method == "POST":
-                response = client.post(url, headers=headers, json=json_body, timeout=30.0)
-            elif method == "PUT":
-                response = client.put(url, headers=headers, json=json_body, timeout=30.0)
-            elif method == "DELETE":
+            elif method.upper() == "POST":
+                response = client.post(
+                    url, headers=headers, json=json_body, timeout=30.0
+                )
+            elif method.upper() == "PUT":
+                response = client.put(
+                    url, headers=headers, json=json_body, timeout=30.0
+                )
+            elif method.upper() == "DELETE":
                 response = client.delete(url, headers=headers, timeout=30.0)
             else:
-                return json_module.dumps({
-                    "status_code": 400,
-                    "body": f"Error: Unsupported HTTP method '{method}'"
-                })
-            
-            try:
-                response_body = response.json()
-            except:
-                response_body = response.text
-            
-            return json_module.dumps({
-                "status_code": response.status_code,
-                "body": response_body
-            })
-            
-    except httpx.TimeoutException:
-        return json_module.dumps({"status_code": 504, "body": "Request timeout"})
-    except httpx.ConnectError:
-        return json_module.dumps({"status_code": 503, "body": f"Could not connect to {AGENT_API_BASE_URL}"})
+                return json_module.dumps(
+                    {
+                        "status_code": 400,
+                        "body": f"Error: Unsupported HTTP method '{method}'",
+                    }
+                )
+
+            # Return response as JSON string
+            return json_module.dumps(
+                {"status_code": response.status_code, "body": response.text}
+            )
+
+    except httpx.ReadTimeout as e:
+        return json_module.dumps(
+            {"status_code": 504, "body": f"Error: Request timed out: {e}"}
+        )
+    except httpx.ConnectError as e:
+        return json_module.dumps(
+            {
+                "status_code": 503,
+                "body": f"Error: Cannot connect to backend API at {url}: {e}",
+            }
+        )
+    except json_module.JSONDecodeError as e:
+        return json_module.dumps(
+            {"status_code": 400, "body": f"Error: Invalid JSON in body: {e}"}
+        )
     except Exception as e:
-        return json_module.dumps({"status_code": 500, "body": f"Error: {str(e)}"})
+        return json_module.dumps({"status_code": 500, "body": f"Error: {e}"})
+
 
 # Map of tool names to functions
 TOOLS = {
@@ -253,20 +309,46 @@ TOOLS = {
     "query_api": query_api,
 }
 
+
 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
-    """Execute a tool by name with the given arguments."""
+    """Execute a tool by name with the given arguments.
+
+    Args:
+        name: Tool name (e.g., 'read_file')
+        arguments: Tool arguments as dict
+
+    Returns:
+        Tool result as string
+    """
     if name not in TOOLS:
         return f"Error: Unknown tool '{name}'"
+
     func = TOOLS[name]
     try:
         return func(**arguments)
+    except TypeError as e:
+        return f"Error: Invalid arguments for {name}: {e}"
     except Exception as e:
         return f"Error executing {name}: {e}"
 
-def call_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Send messages to the LLM and return the response."""
+
+def call_llm(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Send messages to the LLM and return the response.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+        tools: Optional list of tool definitions
+
+    Returns:
+        LLM response as dict
+    """
     if not LLM_API_BASE or not LLM_API_KEY:
-        raise RuntimeError("LLM not configured. Check .env.agent.secret")
+        raise RuntimeError(
+            "LLM not configured. Check .env.agent.secret and ensure "
+            "LLM_API_BASE and LLM_API_KEY are set."
+        )
 
     url = f"{LLM_API_BASE.rstrip('/')}/chat/completions"
     headers = {
@@ -283,71 +365,133 @@ def call_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None 
     if tools:
         payload["tools"] = tools
 
-    for attempt in range(3):
-        try:
-            response = httpx.post(url, headers=headers, json=payload, timeout=60.0)
-            response.raise_for_status()
-            return response.json()
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(2.0)
-    
-    raise RuntimeError("Failed to get LLM response after max retries")
+    max_retries = 3
+    retry_delay = 2.0
+
+    with httpx.Client() as client:
+        for attempt in range(max_retries):
+            try:
+                response = client.post(url, headers=headers, json=payload, timeout=60.0)
+
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    else:
+                        raise RuntimeError("Max retries exceeded due to rate limiting")
+
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.ReadTimeout as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                raise RuntimeError("Request timed out after max retries") from e
+
+    raise RuntimeError("LLM request failed after all retries")
+
 
 def run_agentic_loop(question: str) -> dict[str, Any]:
-    """Main agentic loop: processes question with tool calling."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.append({"role": "user", "content": question})
-    tool_calls_log = []
+    """Run the agentic loop to answer a question.
 
-    for _ in range(MAX_TOOL_CALLS):
+    Args:
+        question: User's question
+
+    Returns:
+        Result dict with 'answer', 'source', and 'tool_calls'
+    """
+    # Initialize messages with system prompt and user question
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+
+    # Track tool calls for output
+    tool_calls_log: list[dict[str, Any]] = []
+
+    # Agentic loop
+    for iteration in range(MAX_TOOL_CALLS):
+        # Call LLM with tool definitions
+        response = call_llm(messages, tools=TOOL_DEFINITIONS)
+
+        # Parse response
         try:
-            response = call_llm(messages, tools=TOOL_DEFINITIONS)
-        except Exception as e:
-            return {
-                "answer": f"Error calling LLM: {e}",
-                "source": "",
-                "tool_calls": tool_calls_log,
-            }
+            choice = response["choices"][0]["message"]
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"Unexpected LLM response: {response}") from e
 
-        message = response["choices"][0]["message"]
+        # Check for tool calls
+        tool_calls = choice.get("tool_calls")
 
-        if "tool_calls" in message and message["tool_calls"]:
-            messages.append({"role": "assistant", "tool_calls": message["tool_calls"]})
-            
-            for tool_call in message["tool_calls"]:
+        if tool_calls:
+            # LLM wants to call tools
+
+            # Add assistant message with tool calls
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            # Execute each tool call
+            for tool_call in tool_calls:
                 tool_name = tool_call["function"]["name"]
-                try:
-                    tool_args = json.loads(tool_call["function"]["arguments"])
-                except json.JSONDecodeError:
-                    tool_args = {}
-                
+                tool_args = json.loads(tool_call["function"]["arguments"])
+                tool_call_id = tool_call["id"]
+
+                # Execute tool
                 result = execute_tool(tool_name, tool_args)
-                
-                tool_calls_log.append({
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result": result,
-                })
-                
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": result,
-                })
+
+                # Log tool call for output
+                tool_calls_log.append(
+                    {
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": result,
+                    }
+                )
+
+                # Add tool result as tool role message
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result,
+                    }
+                )
+
+            # Loop back to call LLM with tool results
+            continue
+
         else:
-            answer = message.get("content", "")
+            # LLM returned content without tool calls - final answer
+            # Note: Use (choice.get("content") or "") because LLM may return content: null
+            answer = choice.get("content") or ""
+
+            # Extract source from answer (look for source reference)
             source = ""
-            
             if "source:" in answer.lower():
+                # Try to extract source from the answer
+                import re
+
+                # Match patterns like:
+                # - "Source: wiki/github.md"
+                # - "Source: `backend/app/routers/analytics.py`"
+                # - "Source: backend/app/routers/analytics.py, line 212"
+                # Find all matches and prefer file paths over API endpoints
                 matches = re.findall(
                     r"source:\s*`?([a-zA-Z0-9_/.-]+\.(py|md|json|yml|yaml))",
                     answer,
                     re.IGNORECASE,
                 )
                 if matches:
+                    # Extract just the file paths (first group)
                     file_paths = [m[0] for m in matches]
+                    # Prefer Python files
                     for path in file_paths:
                         if path.endswith(".py"):
                             source = path
@@ -361,11 +505,13 @@ def run_agentic_loop(question: str) -> dict[str, Any]:
                 "tool_calls": tool_calls_log,
             }
 
+    # Max iterations reached
     return {
         "answer": "Unable to find answer within maximum tool calls.",
         "source": "",
         "tool_calls": tool_calls_log,
     }
+
 
 def main():
     if len(sys.argv) != 2:
@@ -373,10 +519,16 @@ def main():
         sys.exit(1)
 
     question = sys.argv[1]
-    result = run_agentic_loop(question)
-    
-    # Только JSON в stdout, никаких других print
+
+    try:
+        result = run_agentic_loop(question)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Output single JSON line to stdout
     print(json.dumps(result))
+
 
 if __name__ == "__main__":
     main()
